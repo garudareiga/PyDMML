@@ -10,13 +10,13 @@ MovieLens data set consists of:
     * Simple demographic info for the users (age, gender, occupation, zip)
 '''
 
+import sys
 import os
 import math
 import random
 import csv
 import time
 import json
-import pymongo
 import numpy as np
 from pprint import pprint
 from collections import defaultdict
@@ -58,10 +58,24 @@ class Recommendation():
                     self.user_item_matrix[user_id][item_id] = rating
             
             # Row 0: average rating per movie
-            self.user_item_matrix[0] = np.mean(self.user_item_matrix, axis=0)
+            for item_id in xrange(1, self.user_item_matrix.shape[1]):
+                ratingNum = 0
+                ratingSum = 0.0
+                for user_id in xrange(1, self.user_item_matrix.shape[0]):
+                    if self.user_item_matrix[user_id][item_id]:
+                        ratingNum += 1
+                        ratingSum += self.user_item_matrix[user_id][item_id]
+                self.user_item_matrix[0][item_id] = ratingSum/ratingNum
+                    
             # Column 0: average rating per user
-            for row, avg in enumerate(np.mean(self.user_item_matrix, axis=1)):
-                self.user_item_matrix[row][0] = avg
+            for user_id in xrange(1, self.user_item_matrix.shape[0]):
+                ratingNum = 0
+                ratingSum = 0.0
+                for item_id in xrange(1, self.user_item_matrix.shape[1]):
+                    if self.user_item_matrix[user_id][item_id]:
+                        ratingNum += 1
+                        ratingSum += self.user_item_matrix[user_id][item_id]
+                self.user_item_matrix[user_id][0] = ratingSum/ratingNum
         except IOError, e:
             print e
             
@@ -91,19 +105,26 @@ class Recommendation():
         prod_ij = 0.0
         sum_i = 0.0
         sum_j = 0.0
-        num_corated = 0
+        
+        avgRating_i = self.get_rating(0, i)
+        avgRating_j = self.get_rating(0, j)
         for user_id in xrange(1, self.user_item_matrix.shape[0]):
             if self.user_item_matrix[user_id][i] > 0.0 and self.user_item_matrix[user_id][j] > 0.0:
-                num_corated += 1
-                prod_ij += (self.get_rating(user_id, i) - self.get_rating(0, i))*\
-                    (self.get_rating(user_id, j) - self.get_rating(0, j))
-                sum_i += math.pow((self.get_rating(user_id, i) - self.get_rating(0, i)), 2)
-                sum_j += math.pow((self.get_rating(user_id, j) - self.get_rating(0, j)), 2)
-         
-        if num_corated == 0:
-            return 0.0
+                prod_ij += (self.get_rating(user_id, i) - avgRating_i)*\
+                    (self.get_rating(user_id, j) - avgRating_j)
+                sum_i += math.pow((self.get_rating(user_id, i) - avgRating_i), 2)
+                sum_j += math.pow((self.get_rating(user_id, j) - avgRating_j), 2)
         
-        return prod_ij/(math.sqrt(sum_i)*math.sqrt(sum_j))
+        if False:
+            print('-> Calculate similarity for item {}(mean={}) & {}(mean={})'.
+                  format(i, avgRating_i, j, avgRating_j))
+            print('sum_i={}, sum_j={}, prod_ij={}'.format(sum_i, sum_j, prod_ij))
+       
+        sim = 0.0
+        if prod_ij > 0.0:
+            sim = prod_ij/(math.sqrt(sum_i)*math.sqrt(sum_j))
+        
+        return sim
         
     def item_similarity_adjusted_cosine(self, i, j):
         '''
@@ -157,6 +178,7 @@ class Recommendation():
             similar_items = similar_items[:num_similar_items]
             self.similarity_by_item[item_id] = similar_items
                 
+        #pprint(self.similarity_by_item)
         stop = time.time()                        
         print('Item-based collaborative filtering takes {:.2f} minutes'.format((stop - start)/60.0))
         
@@ -185,18 +207,14 @@ class Recommendation():
         
         return recommendation_list[:num_items]   
             
-    def save_similarity_to_json(self, fname='similarity.json', max_similar_items=100):       
+    def save_similarity_to_json(self, fname='similarity.json'):       
         json_data = {}
         
         for item_id, similar_items in self.similarity_by_item.items():
             json_obj = {}
             
-            count_similar_items = 0
             for similar_item_id, similarity in similar_items:
                 json_obj[similar_item_id] = similarity
-                count_similar_items += 1
-                if count_similar_items == max_similar_items:
-                    break
             
             json_data[item_id] = json_obj
                 
@@ -213,30 +231,63 @@ class Recommendation():
                                                           for similar_item_id, similarity in similar_items.items()]
             
     def save_similarity_to_mongodb(self):
-        #client = MongoClient("mongodb://localhost")
-        pass
+        client = MongoClient("mongodb://localhost")
+        db = client.pydmml
+        collection = db.movielens
+        try:
+            for item_id, similar_items in self.similarity_by_item.items():
+                document = { '_id':item_id, 'similarItems':{} }
+                for similar_item_id, similarity in similar_items:
+                    document['similarItems'][str(similar_item_id)] = round(similarity, 2)
+                collection.insert(document)
+            pass
+        except:
+            print "Error trying to read collection:" + sys.exc_info()[0]
 
     def load_similarity_from_mongodb(self):
-        pass
+        client = MongoClient("mongodb://localhost")
+        db = client.pydmml
+        collection = db.movielens
+        try:
+            dbIter = collection.find()
+            for dbItem in dbIter:
+                item_id = dbItem['_id']
+                self.similarity_by_item[item_id] += [(int(similar_item_id), similarity) 
+                                                          for similar_item_id, similarity in dbItem['similarItems'].items()]                    
+        except:
+            print "Error trying to read collection:" + sys.exc_info()[0]
     
-def test1():
+def test1(jsonName='similarity.json'):
+    ''' 
+    After parsing the training set, find top-100 similar items and their corresponding similiarity score,
+    and the save to a json data file.
+    '''
     obj = Recommendation(num_user=943, num_item=1682)
     obj.parse_data('ml-100k/u.data')
     #obj.dump_csv('user_item_matrix')
-    obj.do_item_based_collaborative_filtering(similarity=obj.item_similarity_pearson)
-    obj.save_similarity_to_json(max_similar_items=20)
+    obj.do_item_based_collaborative_filtering(similarity=obj.item_similarity_pearson, num_similar_items=100)
+    if jsonName:
+        obj.save_similarity_to_json(jsonName)
+    else:
+        obj.save_similarity_to_mongodb() 
               
-def test2():
+def test2(jsonName='similarity.json'):
+    ''' 
+    After loading top-100 similar items and their corresponding similiarity score, make a recommendation
+    for a random user.
+    '''
     obj = Recommendation(num_user=943, num_item=1682)
     obj.parse_data('ml-100k/u.data')
-    obj.load_similarity_from_json('similarity_1.json')
-    
-    user_id = 1
-    #user_id = random.randint(1, obj.num_user)
+    if jsonName:
+        obj.load_similarity_from_json(jsonName)
+    else:
+        obj.load_similarity_from_mongodb()
+        
+    user_id = random.randint(1, obj.num_user)
     recommendations = obj.make_recommendations(user_id)
     print('Recommendation for user ({}):'.format(user_id))
-    print(recommendations)    
+    print(recommendations)
                     
 if __name__ == '__main__':
-    #test1()
-    test2()
+    test1()
+    #test2()
